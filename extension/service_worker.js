@@ -3,6 +3,10 @@
 
 const DEFAULT_POLL_INTERVAL_MINUTES = 5;
 const GRAYLOG_ENDPOINT_STORAGE_KEY = 'graylogEndpoint';
+const HARVEST_GUARD_THRESHOLD_MS = DEFAULT_POLL_INTERVAL_MINUTES * 60 * 1000;
+
+let harvestInProgress = false;
+let harvestGuardTimer = null;
 
 chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === 'install') {
@@ -49,6 +53,23 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 async function scheduleLogHarvest() {
+  if (harvestInProgress) {
+    console.warn(
+      '[ChromeOS Graylog Agent] Previous harvest still in progress; skipping this cycle to avoid overlap.'
+    );
+    return;
+  }
+
+  harvestInProgress = true;
+  clearTimeout(harvestGuardTimer);
+  harvestGuardTimer = setTimeout(() => {
+    console.warn(
+      '[ChromeOS Graylog Agent] Harvest exceeded expected duration; allowing future cycles to proceed.'
+    );
+    harvestInProgress = false;
+    harvestGuardTimer = null;
+  }, HARVEST_GUARD_THRESHOLD_MS);
+
   try {
     const endpoint = await getGraylogEndpoint();
     if (!endpoint.host) {
@@ -67,9 +88,19 @@ async function scheduleLogHarvest() {
       return;
     }
 
-    await forwardToGraylog(endpoint, payload);
+    const compactPayload = pruneEmptySections(payload);
+    if (!compactPayload) {
+      console.warn('[ChromeOS Graylog Agent] Payload contained no actionable data after pruning.');
+      return;
+    }
+
+    await forwardToGraylog(endpoint, compactPayload);
   } catch (error) {
     console.error('[ChromeOS Graylog Agent] Failed to harvest logs', error);
+  } finally {
+    harvestInProgress = false;
+    clearTimeout(harvestGuardTimer);
+    harvestGuardTimer = null;
   }
 }
 
@@ -113,6 +144,34 @@ async function collectLogBundle() {
   }
 
   return payload;
+}
+
+function pruneEmptySections(value) {
+  if (value == null) {
+    return null;
+  }
+
+  if (Array.isArray(value)) {
+    const prunedArray = value
+      .map((entry) => pruneEmptySections(entry))
+      .filter((entry) => entry !== null);
+
+    return prunedArray.length > 0 ? prunedArray : null;
+  }
+
+  if (typeof value === 'object') {
+    const prunedObject = Object.entries(value).reduce((acc, [key, entry]) => {
+      const prunedEntry = pruneEmptySections(entry);
+      if (prunedEntry !== null) {
+        acc[key] = prunedEntry;
+      }
+      return acc;
+    }, {});
+
+    return Object.keys(prunedObject).length > 0 ? prunedObject : null;
+  }
+
+  return value;
 }
 
 async function getDeviceAttributes(errorLog) {
