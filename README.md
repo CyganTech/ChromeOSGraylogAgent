@@ -7,7 +7,7 @@ contains the extension source, documentation, and deployment tooling.
 ## Repository Structure
 
 ```
-├── docs/                  # Architecture and design documentation
+├── docs/                  # Architecture, audit notes, and design references
 ├── extension/             # Chrome extension source code
 │   ├── assets/            # Extension icons and static assets
 │   ├── manifest.json      # Extension manifest (permissions, host policy)
@@ -39,10 +39,13 @@ contains the extension source, documentation, and deployment tooling.
   empty or null sections are dropped and oversized log blobs are truncated
   safely.
 - Delivery attempts use exponential backoff with jitter and a persisted retry
-  queue to avoid losing telemetry during transient outages.
+  queue to avoid losing telemetry during transient outages. The queue is capped
+  to ten payloads with a per-payload size ceiling of 512 KiB to remain within
+  Chrome's managed storage quota.
 - Structured diagnostics are captured in `chrome.storage.local` under
   `graylogDiagnostics` so administrators can inspect configuration or delivery
-  failures.
+  failures. Diagnostics include policy validation failures, retry exhaustion,
+  and API invocation errors.
 
 ## Configuration and Policy
 
@@ -67,9 +70,18 @@ If no managed policy exists, the service worker falls back to locally stored
 settings. HTTP is only honored when a policy explicitly enables
 `allowHttpForTesting`.
 
+## Diagnostics Review
+
+Administrators can inspect the `graylogDiagnostics` collection via the
+`chrome://extensions` debugging tools or by wiring a configuration surface that
+reads from `chrome.storage.local`. Each entry contains a `code`, structured
+`details`, and an ISO timestamp so on-call responders can correlate failures to
+Graylog availability or policy rollouts.
+
 ## Roadmap
 
-- [ ] Extend log collection adapters for additional ChromeOS subsystems.
+- [ ] Restrict host permissions to only the approved Graylog domains surfaced
+      by enterprise policy.
 - [ ] Add automated tests and CI workflows.
 - [ ] Integrate authenticated delivery (mTLS or OAuth) for Graylog inputs.
 

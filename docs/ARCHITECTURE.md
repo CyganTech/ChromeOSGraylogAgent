@@ -20,6 +20,8 @@ for long-term retention and analysis.
     payloads to Graylog.
   - Persist delivery retries with exponential backoff and emit diagnostics into
     `chrome.storage.local`.
+  - Detect offline states, throttle concurrent harvests, and guard against
+    long-running collection cycles.
 
 ### Manifest
 - **File**: `extension/manifest.json`
@@ -28,6 +30,7 @@ for long-term retention and analysis.
     `logPrivate`, `enterprise.deviceAttributes`).
   - Scope `host_permissions` to HTTPS (and optional HTTP testing) endpoints so
     policy-driven allow-lists remain enforceable.
+  - Surface the background service worker entry point.
 
 ## Data Flow
 1. The service worker merges managed policy with local defaults and validates
@@ -35,9 +38,19 @@ for long-term retention and analysis.
 2. Using Chrome enterprise APIs, the extension collects device identifiers and
    diagnostics payloads.
 3. Payloads are pruned, size-limited, and enqueued for delivery. Exponential
-   backoff with jitter ensures retries do not overload Graylog.
+   backoff with jitter ensures retries do not overload Graylog and respects a
+   retry limit of five attempts per payload.
 4. Delivery outcomes and policy validation errors are persisted in
-   `graylogDiagnostics` for administrator review.
+   `graylogDiagnostics` for administrator review. Diagnostics deduplicate
+   consecutive identical events to reduce noise.
+
+## Storage Model
+- **Managed policy**: `chrome.storage.managed.graylogConfig` supplies the
+  canonical endpoint definition and collection cadence controls.
+- **Local storage**: `chrome.storage.local` holds the merged configuration,
+  delivery retry queue (`graylogDeliveryQueue`), and diagnostic events
+  (`graylogDiagnostics`). The queue is capped at 10 entries and subject to a
+  512 KiB payload budget to remain within Chrome's 5 MiB storage quota.
 
 ## Security Considerations
 - Leverage Chrome enterprise policies to restrict deployment to managed
@@ -47,10 +60,13 @@ for long-term retention and analysis.
 - Enforce strict schema validation to avoid leaking unintended data, and trim
   oversized payloads before dispatching.
 - Provide clear retention and redaction controls to satisfy compliance needs.
+- Restrict host permissions in the manifest to only the sanctioned Graylog
+  domains.
 
-## Next Steps
-- Implement log collectors leveraging `chrome.logPrivate` and
-  `chrome.diagnostics`.  
-- Add Graylog GELF payload builder with compression support.  
-- Integrate with enterprise policy storage for centrally managed settings.  
-- Develop integration tests and deployment documentation.
+## Open Questions / Next Steps
+- Evaluate authenticated delivery (mTLS, OAuth, or signed payloads) for Graylog
+  inputs.
+- Add automated tests around configuration merging, queue rollover, and payload
+  truncation logic.
+- Provide tooling for administrators to inspect diagnostics and manually flush
+  the retry queue when necessary.
