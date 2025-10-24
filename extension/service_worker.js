@@ -15,11 +15,30 @@ chrome.runtime.onInstalled.addListener((details) => {
     });
   }
 
-  chrome.alarms.create('log-collector', {
-    delayInMinutes: 1,
-    periodInMinutes: DEFAULT_POLL_INTERVAL_MINUTES
-  });
+  ensureLogCollectionAlarm();
 });
+
+chrome.runtime.onStartup.addListener(() => {
+  ensureLogCollectionAlarm();
+});
+
+function ensureLogCollectionAlarm() {
+  chrome.alarms.get('log-collector', (existingAlarm) => {
+    if (chrome.runtime.lastError) {
+      console.warn('[ChromeOS Graylog Agent] Failed to inspect alarms', chrome.runtime.lastError);
+      return;
+    }
+
+    if (existingAlarm) {
+      return;
+    }
+
+    chrome.alarms.create('log-collector', {
+      delayInMinutes: 1,
+      periodInMinutes: DEFAULT_POLL_INTERVAL_MINUTES
+    });
+  });
+}
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== 'log-collector') {
@@ -34,6 +53,11 @@ async function scheduleLogHarvest() {
     const endpoint = await getGraylogEndpoint();
     if (!endpoint.host) {
       console.warn('[ChromeOS Graylog Agent] Graylog endpoint not configured.');
+      return;
+    }
+
+    if (typeof self?.navigator?.onLine === 'boolean' && !self.navigator.onLine) {
+      console.warn('[ChromeOS Graylog Agent] Device appears to be offline; skipping harvest.');
       return;
     }
 
@@ -52,7 +76,16 @@ async function scheduleLogHarvest() {
 function getGraylogEndpoint() {
   return new Promise((resolve) => {
     chrome.storage.local.get(GRAYLOG_ENDPOINT_STORAGE_KEY, (data) => {
-      resolve(data[GRAYLOG_ENDPOINT_STORAGE_KEY]);
+      if (chrome.runtime.lastError) {
+        console.warn('[ChromeOS Graylog Agent] Failed to read endpoint configuration', chrome.runtime.lastError);
+      }
+
+      const stored = data?.[GRAYLOG_ENDPOINT_STORAGE_KEY];
+      resolve(
+        stored && typeof stored === 'object'
+          ? stored
+          : { host: '', port: 12201, protocol: 'udp' }
+      );
     });
   });
 }
@@ -298,19 +331,27 @@ async function safeInvoke(description, fn, errorLog, defaultValue = null) {
 async function forwardToGraylog(endpoint, payload) {
   // Placeholder implementation for Graylog GELF HTTP input.
   const url = `${endpoint.protocol}://${endpoint.host}:${endpoint.port}/gelf`;
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), 10000);
   try {
     const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(payload),
+      signal: abortController.signal
     });
 
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
   } catch (error) {
-    console.error('[ChromeOS Graylog Agent] Failed to forward logs', error);
+    const message =
+      error?.name === 'AbortError'
+        ? 'Forwarding timed out while contacting Graylog.'
+        : 'Failed to forward logs to Graylog.';
+    console.warn(`[ChromeOS Graylog Agent] ${message}`, error);
   }
+  clearTimeout(timeoutId);
 }
