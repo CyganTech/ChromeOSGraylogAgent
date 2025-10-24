@@ -29,10 +29,19 @@ contains the extension source, documentation, and deployment tooling.
 5. Deploy the extension to managed ChromeOS devices using your enterprise
    management console and enforce the necessary policies.
 
+## Operational Considerations
+
+- The background alarm introduces a concurrency guard to prevent overlapping
+  collection cycles if a previous run is still in flight.
+- Harvested payloads are compacted before transmission so empty or null
+  sections are dropped, keeping network usage predictable when devices recover
+  from connectivity issues.
+
 ## Roadmap
 
 - [ ] Implement log collection adapters for key ChromeOS subsystems.
-- [ ] Support configurable batching and retry logic for log delivery.
+- [ ] Support configurable batching and retry logic for log delivery (high
+      priority for offline resilience).
 - [ ] Integrate with Chrome enterprise policies for dynamic configuration.
 - [ ] Add automated tests and CI workflows.
 
