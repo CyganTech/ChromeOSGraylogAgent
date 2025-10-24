@@ -13,8 +13,7 @@
     "enterprise.deviceAttributes"
   ],
   "host_permissions": [
-    "https://*/*",
-    "http://*/*"
+    "https://logs.example.com/*"
   ],
   "background": {
     "service_worker": "service_worker.js"

@@ -29,7 +29,9 @@ for long-term retention and analysis.
   - Declare the reduced permission set (`storage`, `alarms`, `system.*`,
     `logPrivate`, `enterprise.deviceAttributes`).
   - Scope `host_permissions` to HTTPS (and optional HTTP testing) endpoints so
-    policy-driven allow-lists remain enforceable.
+    policy-driven allow-lists remain enforceable. Hosts that are not declared in
+    the manifest are automatically ignored and produce diagnostics so
+    administrators can reconcile mismatches.
   - Surface the background service worker entry point.
 
 ## Data Flow
@@ -49,8 +51,23 @@ for long-term retention and analysis.
   canonical endpoint definition and collection cadence controls.
 - **Local storage**: `chrome.storage.local` holds the merged configuration,
   delivery retry queue (`graylogDeliveryQueue`), and diagnostic events
-  (`graylogDiagnostics`). The queue is capped at 10 entries and subject to a
-  512 KiB payload budget to remain within Chrome's 5 MiB storage quota.
+  (`graylogDiagnostics`). The queue is capped at six entries and aggressively
+  trimmed to remain under a 4 MiB storage budget. Trimming events are surfaced
+  through diagnostics to highlight quota pressure.
+
+## Administrative Interface
+
+Incident response tooling can communicate with the service worker using
+`chrome.runtime.sendMessage`:
+
+- `graylog:exportDiagnostics` – returns the merged set of persisted and
+  transient diagnostics so on-call teams can export state for offline analysis.
+- `graylog:clearRetryQueue` – purges the delivery queue, cancels any retry
+  alarms, and records that the queue was cleared manually.
+- `graylog:flushRetryQueue` – forces an immediate retry attempt and reports the
+  remaining queue length.
+- `graylog:clearDiagnostics` – wipes both persisted and in-memory diagnostics to
+  start fresh after an incident.
 
 ## Security Considerations
 - Leverage Chrome enterprise policies to restrict deployment to managed

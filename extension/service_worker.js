@@ -12,12 +12,16 @@ const GRAYLOG_ENDPOINT_STORAGE_KEY = 'graylogEndpoint'; // Legacy key retained f
 const GRAYLOG_DELIVERY_QUEUE_STORAGE_KEY = 'graylogDeliveryQueue';
 const DIAGNOSTICS_STORAGE_KEY = 'graylogDiagnostics';
 const MAX_DIAGNOSTIC_ENTRIES = 100;
-const MAX_DELIVERY_QUEUE_LENGTH = 10;
+const MAX_DELIVERY_QUEUE_LENGTH = 6;
 const MAX_DELIVERY_ATTEMPTS = 5;
 const BACKOFF_BASE_MS = 30 * 1000;
 const MAX_BACKOFF_DELAY_MS = 60 * 60 * 1000;
 const PAYLOAD_SIZE_LIMIT_BYTES = 512 * 1024;
 const HOSTNAME_PATTERN = /^[a-zA-Z0-9.-]+$/;
+const MAX_STORAGE_BUDGET_BYTES = 4 * 1024 * 1024; // Safety margin below Chrome's 5 MiB quota.
+
+const transientDiagnostics = [];
+const manifestHostPermissionMatchers = buildManifestHostPermissionMatchers();
 
 let harvestInProgress = false;
 let harvestGuardTimer = null;
@@ -73,6 +77,24 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === RETRY_ALARM_NAME) {
     await flushDeliveryQueue();
   }
+});
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  const responsePromise = handleAdministrativeMessage(message, sender);
+  if (!responsePromise) {
+    return false;
+  }
+
+  responsePromise
+    .then((payload) => {
+      sendResponse({ success: true, ...payload });
+    })
+    .catch((error) => {
+      console.warn('[ChromeOS Graylog Agent] Administrative request failed', error);
+      sendResponse({ success: false, message: error?.message ?? String(error) });
+    });
+
+  return true;
 });
 
 async function initializeDefaultSettings() {
@@ -518,12 +540,18 @@ async function enqueuePayloadForRetry(endpoint, payload, attempt) {
   const entry = createRetryEntry(endpoint, payload, attempt);
   queue.push(entry);
 
-  while (queue.length > MAX_DELIVERY_QUEUE_LENGTH) {
-    queue.shift();
+  const budget = enforceQueueBudget(queue);
+  if (budget.removed > 0) {
+    await recordDiagnostic('delivery-queue-trimmed', {
+      removed: budget.removed,
+      trimmedByCount: budget.trimmedByCount,
+      trimmedBySize: budget.trimmedBySize,
+      remaining: budget.queue.length
+    });
   }
 
-  await saveDeliveryQueue(queue);
-  await scheduleRetryAlarm(queue);
+  await saveDeliveryQueue(budget.queue);
+  await scheduleRetryAlarm(budget.queue);
   await recordDiagnostic('delivery-queued', {
     host: endpoint.host,
     attempt
@@ -559,7 +587,7 @@ async function processDeliveryQueue() {
   }
 
   const now = Date.now();
-  const nextQueue = [];
+  let nextQueue = [];
   let mutated = false;
 
   for (const entry of queue) {
@@ -596,22 +624,35 @@ async function processDeliveryQueue() {
     mutated = true;
   }
 
+  let finalQueue = nextQueue;
   if (mutated) {
-    await saveDeliveryQueue(nextQueue);
+    const budget = enforceQueueBudget(nextQueue);
+    finalQueue = budget.queue;
+    if (budget.removed > 0) {
+      await recordDiagnostic('delivery-queue-trimmed', {
+        removed: budget.removed,
+        trimmedByCount: budget.trimmedByCount,
+        trimmedBySize: budget.trimmedBySize,
+        remaining: finalQueue.length
+      });
+    }
+    await saveDeliveryQueue(finalQueue);
+  } else {
+    finalQueue = queue;
   }
 
-  await scheduleRetryAlarm(nextQueue);
+  await scheduleRetryAlarm(finalQueue);
 }
 
 async function loadDeliveryQueue() {
-  const data = await getStorageLocal(GRAYLOG_DELIVERY_QUEUE_STORAGE_KEY);
+  const { data } = await getStorageLocal(GRAYLOG_DELIVERY_QUEUE_STORAGE_KEY);
   const queue = data?.[GRAYLOG_DELIVERY_QUEUE_STORAGE_KEY];
 
   if (!Array.isArray(queue)) {
     return [];
   }
 
-  return queue
+  const normalized = queue
     .map((entry) => {
       if (!entry || typeof entry !== 'object') {
         return null;
@@ -629,6 +670,20 @@ async function loadDeliveryQueue() {
       };
     })
     .filter(Boolean);
+
+  const budget = enforceQueueBudget(normalized);
+  if (budget.removed > 0) {
+    await recordDiagnostic('delivery-queue-trimmed', {
+      removed: budget.removed,
+      trimmedByCount: budget.trimmedByCount,
+      trimmedBySize: budget.trimmedBySize,
+      remaining: budget.queue.length
+    });
+    await saveDeliveryQueue(budget.queue);
+    return budget.queue;
+  }
+
+  return normalized;
 }
 
 async function saveDeliveryQueue(queue) {
@@ -680,6 +735,242 @@ function createRetryEntry(endpoint, payload, attempt) {
     attempt,
     nextAttemptTime: Date.now() + delay
   };
+}
+
+function enforceQueueBudget(queue) {
+  const working = Array.isArray(queue) ? [...queue] : [];
+  let trimmedByCount = 0;
+  while (working.length > MAX_DELIVERY_QUEUE_LENGTH) {
+    working.shift();
+    trimmedByCount += 1;
+  }
+
+  let trimmedBySize = 0;
+  let estimatedSize = estimateQueueSizeBytes(working);
+  while (estimatedSize > MAX_STORAGE_BUDGET_BYTES && working.length > 0) {
+    working.shift();
+    trimmedBySize += 1;
+    estimatedSize = estimateQueueSizeBytes(working);
+  }
+
+  return {
+    queue: working,
+    removed: trimmedByCount + trimmedBySize,
+    trimmedByCount,
+    trimmedBySize,
+    estimatedSize
+  };
+}
+
+function estimateQueueSizeBytes(entries) {
+  try {
+    const serialized = JSON.stringify(entries ?? []);
+    if (typeof serialized !== 'string') {
+      return 0;
+    }
+    return new TextEncoder().encode(serialized).length;
+  } catch (error) {
+    console.warn('[ChromeOS Graylog Agent] Failed to estimate queue size', error);
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
+function diagnosticsEntriesMatch(a, b) {
+  if (!a || !b) {
+    return false;
+  }
+
+  if (a.code !== b.code) {
+    return false;
+  }
+
+  try {
+    const aDetails = JSON.stringify(a.details ?? {});
+    const bDetails = JSON.stringify(b.details ?? {});
+    return aDetails === bDetails;
+  } catch (error) {
+    console.warn('[ChromeOS Graylog Agent] Failed to compare diagnostic entries', error);
+    return false;
+  }
+}
+
+function filterHostsAgainstManifest(hosts, allowHttpForTesting) {
+  if (!Array.isArray(hosts) || hosts.length === 0) {
+    return { hosts: [], removed: [] };
+  }
+
+  const sanitized = [];
+  const removed = [];
+
+  for (const host of hosts) {
+    const httpsAllowed = manifestHostPermissionMatchers.some((matcher) => matcher('https', host));
+    const httpAllowed = allowHttpForTesting
+      ? manifestHostPermissionMatchers.some((matcher) => matcher('http', host))
+      : true;
+
+    if (httpsAllowed && httpAllowed) {
+      sanitized.push(host);
+    } else {
+      removed.push({
+        host,
+        missingHttps: !httpsAllowed,
+        missingHttp: allowHttpForTesting && !httpAllowed
+      });
+    }
+  }
+
+  return { hosts: sanitized, removed };
+}
+
+function buildManifestHostPermissionMatchers() {
+  if (!chrome?.runtime?.getManifest) {
+    return [];
+  }
+
+  try {
+    const manifest = chrome.runtime.getManifest();
+    const patterns = Array.isArray(manifest?.host_permissions) ? manifest.host_permissions : [];
+    return patterns
+      .map((pattern) => createManifestHostMatcher(pattern))
+      .filter(Boolean);
+  } catch (error) {
+    console.warn('[ChromeOS Graylog Agent] Failed to inspect manifest host permissions', error);
+    return [];
+  }
+}
+
+function createManifestHostMatcher(pattern) {
+  if (pattern === '<all_urls>') {
+    return () => true;
+  }
+
+  if (typeof pattern !== 'string') {
+    return null;
+  }
+
+  const trimmed = pattern.trim();
+  const schemeSplit = trimmed.split('://');
+  if (schemeSplit.length !== 2) {
+    return null;
+  }
+
+  const scheme = schemeSplit[0].toLowerCase();
+  const remainder = schemeSplit[1];
+  const slashIndex = remainder.indexOf('/');
+  const hostPattern = (slashIndex === -1 ? remainder : remainder.slice(0, slashIndex)).toLowerCase();
+
+  return (protocol, host) => {
+    if (!protocol || !host) {
+      return false;
+    }
+
+    const normalizedProtocol = protocol.toLowerCase();
+    const normalizedHost = host.toLowerCase();
+
+    if (scheme !== '*' && scheme !== '<all_urls>' && scheme !== normalizedProtocol) {
+      return false;
+    }
+
+    if (hostPattern === '*') {
+      return true;
+    }
+
+    if (hostPattern.startsWith('*.')) {
+      const suffix = hostPattern.slice(2);
+      return normalizedHost === suffix || normalizedHost.endsWith(`.${suffix}`);
+    }
+
+    return hostPattern === normalizedHost;
+  };
+}
+
+async function handleAdministrativeMessage(message, sender) {
+  if (!message || typeof message !== 'object') {
+    return null;
+  }
+
+  if (sender?.id && sender.id !== chrome.runtime.id) {
+    return null;
+  }
+
+  const action = typeof message.type === 'string' ? message.type : message.action;
+
+  switch (action) {
+    case 'graylog:exportDiagnostics':
+      return (async () => ({ diagnostics: await collectDiagnosticsSnapshot() }))();
+    case 'graylog:clearRetryQueue':
+      return (async () => {
+        await saveDeliveryQueue([]);
+        await clearRetryAlarm();
+        await recordDiagnostic('delivery-queue-cleared', { source: 'admin-request' });
+        return { cleared: true };
+      })();
+    case 'graylog:flushRetryQueue':
+      return (async () => {
+        await flushDeliveryQueue({ allowDuringHarvest: true });
+        const queue = await loadDeliveryQueue();
+        await recordDiagnostic('delivery-queue-flush-requested', {
+          source: 'admin-request',
+          remaining: queue.length
+        });
+        return { remaining: queue.length };
+      })();
+    case 'graylog:clearDiagnostics':
+      return (async () => {
+        transientDiagnostics.length = 0;
+        await setStorageLocal({ [DIAGNOSTICS_STORAGE_KEY]: [] });
+        return { cleared: true };
+      })();
+    default:
+      return null;
+  }
+}
+
+async function collectDiagnosticsSnapshot() {
+  const { data, success } = await getStorageLocal(DIAGNOSTICS_STORAGE_KEY);
+  const persisted = success && Array.isArray(data?.[DIAGNOSTICS_STORAGE_KEY])
+    ? data[DIAGNOSTICS_STORAGE_KEY]
+    : [];
+
+  const merged = mergeDiagnostics(persisted, transientDiagnostics);
+  return merged;
+}
+
+function mergeDiagnostics(persisted, transient) {
+  const combined = [];
+  const seen = new Set();
+
+  const append = (entry) => {
+    if (!entry) {
+      return;
+    }
+    const key = buildDiagnosticIdentity(entry);
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    combined.push(entry);
+  };
+
+  persisted.forEach(append);
+  transient.forEach(append);
+
+  combined.sort((a, b) => {
+    const aTime = Date.parse(a?.timestamp ?? '') || 0;
+    const bTime = Date.parse(b?.timestamp ?? '') || 0;
+    return aTime - bTime;
+  });
+
+  return combined.slice(-MAX_DIAGNOSTIC_ENTRIES);
+}
+
+function buildDiagnosticIdentity(entry) {
+  try {
+    return [entry?.code ?? 'unknown', JSON.stringify(entry?.details ?? {}), entry?.timestamp ?? ''].join('|');
+  } catch (error) {
+    console.warn('[ChromeOS Graylog Agent] Failed to build diagnostic identity', error);
+    return `${entry?.code ?? 'unknown'}|${entry?.timestamp ?? ''}`;
+  }
 }
 
 function computeGuardThresholdMs(config) {
@@ -809,7 +1100,7 @@ async function readManagedConfiguration() {
 }
 
 async function readLocalConfiguration() {
-  const data = await getStorageLocal([GRAYLOG_SETTINGS_STORAGE_KEY, GRAYLOG_ENDPOINT_STORAGE_KEY]);
+  const { data } = await getStorageLocal([GRAYLOG_SETTINGS_STORAGE_KEY, GRAYLOG_ENDPOINT_STORAGE_KEY]);
   const settings = data?.[GRAYLOG_SETTINGS_STORAGE_KEY];
   const legacyEndpoint = data?.[GRAYLOG_ENDPOINT_STORAGE_KEY];
 
@@ -836,12 +1127,24 @@ function normalizeConfigurationSource(raw) {
         .filter((host) => host && HOSTNAME_PATTERN.test(host))
     : [];
 
+  const hostPermissionCheck = filterHostsAgainstManifest(allowedHosts, allowHttpForTesting);
+  const sanitizedAllowedHosts = hostPermissionCheck.hosts;
+  hostPermissionCheck.removed.forEach((item) => {
+    recordDiagnostic('host-permission-mismatch', {
+      host: item.host,
+      missingHttps: item.missingHttps === true,
+      missingHttp: item.missingHttp === true
+    }).catch((error) => {
+      console.warn('[ChromeOS Graylog Agent] Failed to report host permission mismatch', error);
+    });
+  });
+
   const endpointCandidate =
     raw.endpoint && typeof raw.endpoint === 'object' ? raw.endpoint : raw;
 
   const endpointResult = normalizeEndpoint(endpointCandidate, {
     allowHttpForTesting,
-    allowedHosts
+    allowedHosts: sanitizedAllowedHosts
   });
 
   return {
@@ -851,7 +1154,7 @@ function normalizeConfigurationSource(raw) {
     pollIntervalMinutes: sanitizeOptionalNumber(raw.pollIntervalMinutes),
     guardThresholdMinutes: sanitizeOptionalNumber(raw.guardThresholdMinutes),
     allowHttpForTesting,
-    allowedHosts
+    allowedHosts: sanitizedAllowedHosts
   };
 }
 
@@ -970,25 +1273,39 @@ function normalizeEndpoint(rawEndpoint, options = {}) {
   return { endpoint, valid, errors };
 }
 
-async function recordDiagnostic(code, details = {}) {
+async function recordDiagnostic(code, details = {}, options = {}) {
+  const entry = {
+    code,
+    details,
+    timestamp: new Date().toISOString()
+  };
+
+  const lastTransient = transientDiagnostics[transientDiagnostics.length - 1];
+  if (lastTransient && diagnosticsEntriesMatch(lastTransient, entry)) {
+    return;
+  }
+
+  transientDiagnostics.push(entry);
+  if (transientDiagnostics.length > MAX_DIAGNOSTIC_ENTRIES) {
+    transientDiagnostics.splice(0, transientDiagnostics.length - MAX_DIAGNOSTIC_ENTRIES);
+  }
+
+  if (options.skipStorage === true) {
+    return;
+  }
+
   try {
-    const data = await getStorageLocal(DIAGNOSTICS_STORAGE_KEY);
+    const { data, success } = await getStorageLocal(DIAGNOSTICS_STORAGE_KEY);
+    if (!success) {
+      return;
+    }
+
     const existing = Array.isArray(data?.[DIAGNOSTICS_STORAGE_KEY])
       ? data[DIAGNOSTICS_STORAGE_KEY]
       : [];
 
-    const entry = {
-      code,
-      details,
-      timestamp: new Date().toISOString()
-    };
-
-    const lastEntry = existing[existing.length - 1];
-    if (
-      lastEntry &&
-      lastEntry.code === entry.code &&
-      JSON.stringify(lastEntry.details) === JSON.stringify(entry.details)
-    ) {
+    const lastStored = existing[existing.length - 1];
+    if (lastStored && diagnosticsEntriesMatch(lastStored, entry)) {
       return;
     }
 
@@ -1004,12 +1321,21 @@ function getStorageLocal(keys) {
   return new Promise((resolve) => {
     chrome.storage.local.get(keys, (data) => {
       if (chrome.runtime.lastError) {
-        console.warn('[ChromeOS Graylog Agent] storage.local.get failed', chrome.runtime.lastError);
-        resolve({});
+        const error = chrome.runtime.lastError;
+        console.warn('[ChromeOS Graylog Agent] storage.local.get failed', error);
+        recordDiagnostic(
+          'storage-local-get-failed',
+          {
+            keys: Array.isArray(keys) ? keys : [keys],
+            message: error?.message ?? String(error)
+          },
+          { skipStorage: true }
+        ).catch(() => {});
+        resolve({ data: {}, success: false, error });
         return;
       }
 
-      resolve(data);
+      resolve({ data, success: true });
     });
   });
 }
@@ -1018,9 +1344,21 @@ function setStorageLocal(values) {
   return new Promise((resolve) => {
     chrome.storage.local.set(values, () => {
       if (chrome.runtime.lastError) {
-        console.warn('[ChromeOS Graylog Agent] storage.local.set failed', chrome.runtime.lastError);
+        const error = chrome.runtime.lastError;
+        console.warn('[ChromeOS Graylog Agent] storage.local.set failed', error);
+        recordDiagnostic(
+          'storage-local-set-failed',
+          {
+            keys: Object.keys(values ?? {}),
+            message: error?.message ?? String(error)
+          },
+          { skipStorage: true }
+        ).catch(() => {});
+        resolve({ success: false, error });
+        return;
       }
-      resolve();
+
+      resolve({ success: true });
     });
   });
 }
