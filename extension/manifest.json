@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "ChromeOS Graylog Agent",
+  "description": "Collects ChromeOS device logs and forwards them to a centralized Graylog server.",
+  "version": "0.1.0",
+  "permissions": [
+    "storage",
+    "alarms",
+    "system.memory",
+    "system.storage",
+    "logPrivate",
+    "identity",
+    "enterprise.deviceAttributes",
+    "enterprise.networkingAttributes"
+  ],
+  "optional_permissions": [
+    "debugger"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "icons": {
+    "128": "assets/icon128.png"
+  },
+  "action": {
+    "default_title": "ChromeOS Graylog Agent"
+  },
+  "minimum_chrome_version": "110.0"
+}
