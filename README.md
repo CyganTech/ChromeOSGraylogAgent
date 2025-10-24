@@ -18,10 +18,12 @@ contains the extension source, documentation, and deployment tooling.
 ## Getting Started
 
 1. Update `extension/manifest.json` with your organization's publisher
-   information and tailor the declared `host_permissions` to match the approved
-   Graylog endpoints surfaced by policy. The service worker will ignore hosts
-   that are missing from the manifest and record diagnostics when a mismatch is
-   detected.
+   information and tailor the declared `host_permissions` wildcard to match the
+   approved Graylog endpoints surfaced by policy. The service worker will ignore
+   hosts that are missing from the manifest and record diagnostics when a
+   mismatch is detected. The repository ships with a permissive
+   `https://*.example.com/*` placeholder so multiple sanctioned hosts can be
+   configured via policy without manifest drift.
 2. Review `extension/service_worker.js` and update the default policy fallbacks
    (e.g., allow-listed hosts) to align with your environment. Policies pushed
    via `chrome.storage.managed` should provide `graylogConfig` with `host`,
@@ -52,8 +54,12 @@ contains the extension source, documentation, and deployment tooling.
 
 ## Administrative Workflow
 
-The background service worker exposes a minimal administrative interface via
-`chrome.runtime.sendMessage` for incident response tools:
+The extension exposes administrative controls through the bundled options page
+(`chrome://extensions` → ChromeOS Graylog Agent → **Details** → **Extension
+options**) and the background messaging interface. Both surfaces can be used for
+incident response tooling or manual inspection.
+
+Available actions include:
 
 - `type: "graylog:exportDiagnostics"` – returns a merged snapshot of persisted
   and in-memory diagnostics.
@@ -91,11 +97,13 @@ settings. HTTP is only honored when a policy explicitly enables
 
 ## Diagnostics Review
 
-Administrators can inspect the `graylogDiagnostics` collection via the
-`chrome://extensions` debugging tools or by wiring a configuration surface that
-reads from `chrome.storage.local`. Each entry contains a `code`, structured
-`details`, and an ISO timestamp so on-call responders can correlate failures to
-Graylog availability or policy rollouts.
+Administrators can inspect the `graylogDiagnostics` collection via the options
+page, the `chrome://extensions` debugging tools, or by wiring a configuration
+surface that reads from `chrome.storage.local`. Each entry contains a `code`,
+structured `details`, and an ISO timestamp so on-call responders can correlate
+failures to Graylog availability or policy rollouts. Diagnostics older than 30
+days are pruned automatically to honor retention expectations while retaining at
+most 100 recent entries.
 
 ## Roadmap
 
