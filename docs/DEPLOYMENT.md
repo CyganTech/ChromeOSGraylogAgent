@@ -15,7 +15,8 @@ extension out via the Google Admin console.
 ## 1. Package the extension
 
 Use the packaging utility to create a zip archive with the correct
-`host_permissions` for your Graylog instance:
+`host_permissions` for your Graylog instance. The script writes the archive to
+`dist/chromeos-graylog-agent.zip` by default:
 
 ```bash
 python tools/package_extension.py \
@@ -35,6 +36,9 @@ Use `--dry-run` to preview the manifest changes without creating an archive:
 python tools/package_extension.py --host logs.example.com --dry-run
 ```
 
+Dry-run mode prints the derived version and `host_permissions` so you can
+confirm the manifest matches your expectations before generating a package.
+
 ## 2. Load the package on a Chromebook
 
 1. Copy the generated `.zip` file to the Chromebook.
@@ -43,6 +47,9 @@ python tools/package_extension.py --host logs.example.com --dry-run
 3. Extract the archive into a temporary directory and select the extracted
    folder when prompted. Chrome will register the extension and surface the
    options page.
+4. Open the extension details page and click **Extension options** to access the
+   administrative controls. Use **Export Diagnostics** to verify connectivity
+   and policy evaluation results.
 
 > **Tip:** During testing you can also keep the folder on removable storage to
 > avoid leaving artifacts on the device. Remove the directory after testing to
@@ -75,6 +82,8 @@ configuration forwards data to the host embedded in the manifest.
   validation results, retry queue status, and any delivery errors.
 - Confirm that the Graylog instance receives GELF payloads at the expected
   cadence. The diagnostics log records each successful delivery.
+- Consider using a dedicated Graylog stream or dashboard to isolate test
+  payloads before production rollout.
 
 After testing is complete, remove the unpacked folder and disable Developer
 Mode to return the device to its managed state.

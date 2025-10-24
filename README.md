@@ -7,33 +7,57 @@ contains the extension source, documentation, and deployment tooling.
 ## Repository Structure
 
 ```
-├── docs/                  # Architecture, audit notes, and design references
+├── docs/                  # Architecture details and deployment runbooks
 ├── extension/             # Chrome extension source code
 │   ├── assets/            # Extension icons and static assets
 │   ├── manifest.json      # Extension manifest (permissions, host policy)
 │   └── service_worker.js  # Background service worker and log pipeline
+├── tools/                 # Packaging utilities
 └── README.md
 ```
 
-## Getting Started
+## Key Features
 
-1. Update `extension/manifest.json` with your organization's publisher
-   information and tailor the declared `host_permissions` wildcard to match the
-   approved Graylog endpoints surfaced by policy. The service worker will ignore
-   hosts that are missing from the manifest and record diagnostics when a
-   mismatch is detected. The repository ships with a permissive
-   `https://*.example.com/*` placeholder so multiple sanctioned hosts can be
-   configured via policy without manifest drift.
-2. Review `extension/service_worker.js` and update the default policy fallbacks
-   (e.g., allow-listed hosts) to align with your environment. Policies pushed
-   via `chrome.storage.managed` should provide `graylogConfig` with `host`,
-   `port`, optional `allowedHosts`, and cadence overrides.
-3. Package the extension with `python tools/package_extension.py` to embed your
-   sanctioned host list in the manifest and produce a zip archive suitable for
-   sideloading.
-4. Configure a Graylog HTTP(S) GELF input to receive device log payloads.
-5. Deploy the extension to managed ChromeOS devices using your enterprise
-   management console and enforce the necessary policies.
+- **Policy-aware log forwarding** – The background service worker merges
+  `chrome.storage.managed` policy with local defaults, enforces host
+  allow-lists, trims oversized payloads, and batches delivery retries with
+  exponential backoff.
+- **Administrative diagnostics** – The options page exposes one-click controls
+  to export diagnostics, flush or clear the retry queue, and reset stored
+  events for incident response.
+- **Manifest-aware packaging** – `tools/package_extension.py` rewrites
+  `host_permissions`, optionally bumps the version, and produces a signed zip
+  suitable for sideloading or upload to the Admin console.
+- **Operational safeguards** – Storage quotas, payload sizes, and retry counts
+  are capped to avoid exceeding Chrome extension limits while retaining rich
+  observability signals.
+
+## Quick Start
+
+1. Review `extension/manifest.json` and update publisher metadata if required.
+   The default `https://*.example.com/*` host permission is a placeholder that
+   is replaced during packaging.
+2. Inspect `extension/service_worker.js` to understand the default policy
+   fallbacks (poll cadence, guard window, and HTTP testing flag). Managed
+   deployments should push a `graylogConfig` payload via
+   `chrome.storage.managed`.
+3. Build a test package with the packaging utility:
+
+   ```bash
+   python tools/package_extension.py \
+     --host logs.example.com \
+     --output dist/graylog-agent-test.zip
+   ```
+
+   Use `--host` multiple times for additional destinations. Append
+   `--allow-http` only for controlled lab testing; HTTPS remains the default.
+4. Run `python tools/package_extension.py --dry-run --host logs.example.com` to
+   verify the manifest changes before producing an archive. Dry-run mode prints
+   the derived version and `host_permissions`.
+5. Configure a Graylog HTTP(S) GELF input to receive device log payloads.
+6. Deploy the extension to managed ChromeOS devices via your enterprise
+   management console or sideload it on a test Chromebook (see
+   [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)).
 
 ## Operational Considerations
 
@@ -75,6 +99,15 @@ All responses include a `success` boolean so tooling can surface failures.
 
 See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for step-by-step packaging and
 Chromebook sideloading instructions tailored for test deployments.
+
+## Additional Documentation
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) – Component breakdown and
+  telemetry flow across the service worker, manifest, and administrative
+  surface.
+- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) – Packaging workflow and Chromebook
+  sideloading checklist.
+- [TASKS.md](TASKS.md) – Open items captured during the latest audit.
 
 ## Configuration and Policy
 

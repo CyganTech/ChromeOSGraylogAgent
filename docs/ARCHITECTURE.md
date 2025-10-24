@@ -23,6 +23,15 @@ for long-term retention and analysis.
   - Detect offline states, throttle concurrent harvests, and guard against
     long-running collection cycles.
 
+### Options Page
+- **Files**: `extension/options.html`, `extension/options.js`, `extension/options.css`
+- **Responsibilities**:
+  - Render a minimal administrative surface for exporting diagnostics and
+    managing the retry queue.
+  - Relay button actions to the service worker via `chrome.runtime.sendMessage`
+    and surface success/failure feedback for the operator.
+  - Respect the user's color scheme preference when styling the page.
+
 ### Manifest
 - **File**: `extension/manifest.json`
 - **Responsibilities**:
@@ -32,7 +41,8 @@ for long-term retention and analysis.
     policy-driven allow-lists remain enforceable. Hosts that are not declared in
     the manifest are automatically ignored and produce diagnostics so
     administrators can reconcile mismatches.
-  - Surface the background service worker entry point.
+  - Surface the background service worker entry point and register the options
+    UI for administrators.
 
 ## Data Flow
 1. The service worker merges managed policy with local defaults and validates
@@ -80,10 +90,18 @@ Incident response tooling can communicate with the service worker using
 - Restrict host permissions in the manifest to only the sanctioned Graylog
   domains.
 
+### Packaging Utility
+- **File**: `tools/package_extension.py`
+- **Responsibilities**:
+  - Copy the `extension/` directory, rewrite the manifest with the provided
+    `host_permissions`, and optionally override the version string.
+  - Support dry-run previews so operators can confirm derived metadata before
+    generating an archive.
+  - Produce deterministic zip archives suitable for Chromebook sideloading or
+    Admin console upload.
+
 ## Open Questions / Next Steps
 - Evaluate authenticated delivery (mTLS, OAuth, or signed payloads) for Graylog
   inputs.
 - Add automated tests around configuration merging, queue rollover, and payload
   truncation logic.
-- Provide tooling for administrators to inspect diagnostics and manually flush
-  the retry queue when necessary.
