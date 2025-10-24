@@ -10,12 +10,11 @@
     "system.storage",
     "system.cpu",
     "logPrivate",
-    "identity",
-    "enterprise.deviceAttributes",
-    "enterprise.networkingAttributes"
+    "enterprise.deviceAttributes"
   ],
-  "optional_permissions": [
-    "debugger"
+  "host_permissions": [
+    "https://*/*",
+    "http://*/*"
   ],
   "background": {
     "service_worker": "service_worker.js"
@@ -26,5 +25,5 @@
   "action": {
     "default_title": "ChromeOS Graylog Agent"
   },
-  "minimum_chrome_version": "110.0"
+  "minimum_chrome_version": "138.0.0.0"
 }

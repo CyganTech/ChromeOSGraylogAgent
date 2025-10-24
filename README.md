@@ -10,40 +10,77 @@ contains the extension source, documentation, and deployment tooling.
 ├── docs/                  # Architecture and design documentation
 ├── extension/             # Chrome extension source code
 │   ├── assets/            # Extension icons and static assets
-│   ├── logging/           # Log ingestion helpers (planned)
-│   ├── utils/             # Shared utility modules (planned)
-│   └── service_worker.js  # Background service worker
+│   ├── manifest.json      # Extension manifest (permissions, host policy)
+│   └── service_worker.js  # Background service worker and log pipeline
 └── README.md
 ```
 
 ## Getting Started
 
-1. Update `extension/manifest.json` with your organization's extension details
-   and Graylog permissions requirements.
-2. Implement log collectors under `extension/logging/` to gather the desired
-   ChromeOS diagnostics using `chrome.logPrivate` and related APIs.
+1. Update `extension/manifest.json` with your organization's publisher
+   information and tailor the declared `host_permissions` to match approved
+   Graylog endpoints.
+2. Review `extension/service_worker.js` and update the default policy fallbacks
+   (e.g., allow-listed hosts) to align with your environment. Policies pushed
+   via `chrome.storage.managed` should provide `graylogConfig` with `host`,
+   `port`, optional `allowedHosts`, and cadence overrides.
 3. Build and package the extension using `chrome://extensions` in Developer
    Mode or via the Chrome Web Store publishing workflow.
-4. Configure a Graylog input (HTTP GELF recommended) to receive device log
-   payloads.
+4. Configure a Graylog HTTP(S) GELF input to receive device log payloads.
 5. Deploy the extension to managed ChromeOS devices using your enterprise
    management console and enforce the necessary policies.
 
 ## Operational Considerations
 
 - The background alarm introduces a concurrency guard to prevent overlapping
-  collection cycles if a previous run is still in flight.
-- Harvested payloads are compacted before transmission so empty or null
-  sections are dropped, keeping network usage predictable when devices recover
-  from connectivity issues.
+  collection cycles if a previous run is still in flight. Policy can adjust the
+  poll cadence and guard duration per OU.
+- Harvested payloads are compacted and size-limited before transmission so
+  empty or null sections are dropped and oversized log blobs are truncated
+  safely.
+- Delivery attempts use exponential backoff with jitter and a persisted retry
+  queue to avoid losing telemetry during transient outages.
+- Structured diagnostics are captured in `chrome.storage.local` under
+  `graylogDiagnostics` so administrators can inspect configuration or delivery
+  failures.
+
+## Configuration and Policy
+
+Managed deployments should provide a `graylogConfig` policy payload similar to
+the following:
+
+```json
+{
+  "graylogConfig": {
+    "host": "logs.example.com",
+    "port": 443,
+    "protocol": "https",
+    "allowedHosts": ["logs.example.com"],
+    "pollIntervalMinutes": 5,
+    "guardThresholdMinutes": 10,
+    "allowHttpForTesting": false
+  }
+}
+```
+
+If no managed policy exists, the service worker falls back to locally stored
+settings. HTTP is only honored when a policy explicitly enables
+`allowHttpForTesting`.
 
 ## Roadmap
 
-- [ ] Implement log collection adapters for key ChromeOS subsystems.
-- [ ] Support configurable batching and retry logic for log delivery (high
-      priority for offline resilience).
-- [ ] Integrate with Chrome enterprise policies for dynamic configuration.
+- [ ] Extend log collection adapters for additional ChromeOS subsystems.
 - [ ] Add automated tests and CI workflows.
+- [ ] Integrate authenticated delivery (mTLS or OAuth) for Graylog inputs.
+
+## Governance and Compliance
+
+- Document data retention expectations for the collected payloads and review
+  them against regional privacy requirements (e.g., GDPR, SOC 2, FERPA).
+- Consider masking or excluding sensitive identifiers within
+  `logPrivate.getSystemLogs` before the payload is forwarded.
+- Maintain an approval process for host allow-lists to ensure only sanctioned
+  Graylog clusters receive device telemetry.
 
 ## License
 
