@@ -18,8 +18,10 @@ contains the extension source, documentation, and deployment tooling.
 ## Getting Started
 
 1. Update `extension/manifest.json` with your organization's publisher
-   information and tailor the declared `host_permissions` to match approved
-   Graylog endpoints.
+   information and tailor the declared `host_permissions` to match the approved
+   Graylog endpoints surfaced by policy. The service worker will ignore hosts
+   that are missing from the manifest and record diagnostics when a mismatch is
+   detected.
 2. Review `extension/service_worker.js` and update the default policy fallbacks
    (e.g., allow-listed hosts) to align with your environment. Policies pushed
    via `chrome.storage.managed` should provide `graylogConfig` with `host`,
@@ -40,12 +42,29 @@ contains the extension source, documentation, and deployment tooling.
   safely.
 - Delivery attempts use exponential backoff with jitter and a persisted retry
   queue to avoid losing telemetry during transient outages. The queue is capped
-  to ten payloads with a per-payload size ceiling of 512 KiB to remain within
-  Chrome's managed storage quota.
+  at six payloads and aggressively trimmed to stay within a 4 MiB storage
+  budget. Diagnostics are emitted whenever entries are pruned for quota or
+  length reasons.
 - Structured diagnostics are captured in `chrome.storage.local` under
   `graylogDiagnostics` so administrators can inspect configuration or delivery
   failures. Diagnostics include policy validation failures, retry exhaustion,
   and API invocation errors.
+
+## Administrative Workflow
+
+The background service worker exposes a minimal administrative interface via
+`chrome.runtime.sendMessage` for incident response tools:
+
+- `type: "graylog:exportDiagnostics"` – returns a merged snapshot of persisted
+  and in-memory diagnostics.
+- `type: "graylog:clearRetryQueue"` – empties the retry queue, clears pending
+  alarms, and records a diagnostic noting the manual intervention.
+- `type: "graylog:flushRetryQueue"` – forces an immediate delivery attempt and
+  responds with the number of entries remaining.
+- `type: "graylog:clearDiagnostics"` – wipes persisted diagnostics and the
+  in-memory buffer, providing a clean slate for subsequent incidents.
+
+All responses include a `success` boolean so tooling can surface failures.
 
 ## Configuration and Policy
 
@@ -80,8 +99,6 @@ Graylog availability or policy rollouts.
 
 ## Roadmap
 
-- [ ] Restrict host permissions to only the approved Graylog domains surfaced
-      by enterprise policy.
 - [ ] Add automated tests and CI workflows.
 - [ ] Integrate authenticated delivery (mTLS or OAuth) for Graylog inputs.
 
