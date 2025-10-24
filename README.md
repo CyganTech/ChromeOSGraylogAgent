@@ -28,8 +28,9 @@ contains the extension source, documentation, and deployment tooling.
    (e.g., allow-listed hosts) to align with your environment. Policies pushed
    via `chrome.storage.managed` should provide `graylogConfig` with `host`,
    `port`, optional `allowedHosts`, and cadence overrides.
-3. Build and package the extension using `chrome://extensions` in Developer
-   Mode or via the Chrome Web Store publishing workflow.
+3. Package the extension with `python tools/package_extension.py` to embed your
+   sanctioned host list in the manifest and produce a zip archive suitable for
+   sideloading.
 4. Configure a Graylog HTTP(S) GELF input to receive device log payloads.
 5. Deploy the extension to managed ChromeOS devices using your enterprise
    management console and enforce the necessary policies.
@@ -71,6 +72,9 @@ Available actions include:
   in-memory buffer, providing a clean slate for subsequent incidents.
 
 All responses include a `success` boolean so tooling can surface failures.
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for step-by-step packaging and
+Chromebook sideloading instructions tailored for test deployments.
 
 ## Configuration and Policy
 
