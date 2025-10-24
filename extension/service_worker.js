@@ -515,7 +515,8 @@ async function forwardToGraylog(endpoint, payload) {
         'Content-Type': 'application/json'
       },
       body,
-      signal: abortController.signal
+      signal: abortController.signal,
+      keepalive: true
     });
 
     if (!response.ok) {
