@@ -12,6 +12,7 @@ const GRAYLOG_ENDPOINT_STORAGE_KEY = 'graylogEndpoint'; // Legacy key retained f
 const GRAYLOG_DELIVERY_QUEUE_STORAGE_KEY = 'graylogDeliveryQueue';
 const DIAGNOSTICS_STORAGE_KEY = 'graylogDiagnostics';
 const MAX_DIAGNOSTIC_ENTRIES = 100;
+const DIAGNOSTIC_RETENTION_DAYS = 30;
 const MAX_DELIVERY_QUEUE_LENGTH = 6;
 const MAX_DELIVERY_ATTEMPTS = 5;
 const BACKOFF_BASE_MS = 30 * 1000;
@@ -19,9 +20,14 @@ const MAX_BACKOFF_DELAY_MS = 60 * 60 * 1000;
 const PAYLOAD_SIZE_LIMIT_BYTES = 512 * 1024;
 const HOSTNAME_PATTERN = /^[a-zA-Z0-9.-]+$/;
 const MAX_STORAGE_BUDGET_BYTES = 4 * 1024 * 1024; // Safety margin below Chrome's 5 MiB quota.
+const DIAGNOSTIC_RETENTION_WINDOW_MS = DIAGNOSTIC_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 
 const transientDiagnostics = [];
 const manifestHostPermissionMatchers = buildManifestHostPermissionMatchers();
+
+enforceDiagnosticRetention().catch((error) => {
+  console.warn('[ChromeOS Graylog Agent] Failed to enforce diagnostic retention on startup', error);
+});
 
 let harvestInProgress = false;
 let harvestGuardTimer = null;
@@ -1008,12 +1014,20 @@ async function enforcePayloadConstraints(payload) {
     return payload;
   }
 
+  const originalSize = serialized.length;
+  const originalSystemLogCount = Array.isArray(payload?.logArtifacts?.systemLogs)
+    ? payload.logArtifacts.systemLogs.length
+    : 0;
+
   if (serialized.length <= PAYLOAD_SIZE_LIMIT_BYTES) {
     return payload;
   }
 
   const trimmed = cloneSerializable(payload);
   let truncated = false;
+  let systemLogTruncations = 0;
+  let systemLogsRemoved = false;
+  let logArtifactsRemoved = false;
 
   if (trimmed?.logArtifacts?.systemLogs) {
     const logs = Array.isArray(trimmed.logArtifacts.systemLogs)
@@ -1026,6 +1040,7 @@ async function enforcePayloadConstraints(payload) {
 
       if (typeof entry.log === 'string' && entry.log.length > 4096) {
         truncated = true;
+        systemLogTruncations += 1;
         return { ...entry, log: entry.log.slice(-4096), truncated: true };
       }
 
@@ -1042,16 +1057,32 @@ async function enforcePayloadConstraints(payload) {
     trimmed.logArtifactsTruncated = true;
     serialized = JSON.stringify(trimmed);
     truncated = true;
+    systemLogsRemoved = true;
   }
 
   if (serialized.length > PAYLOAD_SIZE_LIMIT_BYTES && trimmed.logArtifacts) {
     delete trimmed.logArtifacts;
     trimmed.payloadTruncated = true;
     truncated = true;
+    logArtifactsRemoved = true;
   }
 
   if (truncated) {
-    await recordDiagnostic('payload-truncated', { size: serialized.length });
+    const remainingSystemLogCount = Array.isArray(trimmed?.logArtifacts?.systemLogs)
+      ? trimmed.logArtifacts.systemLogs.length
+      : 0;
+
+    await recordDiagnostic('payload-truncated', {
+      originalSize,
+      finalSize: serialized.length,
+      logArtifactsTruncated: trimmed?.logArtifactsTruncated === true,
+      payloadTruncated: trimmed?.payloadTruncated === true,
+      systemLogEntriesBefore: originalSystemLogCount,
+      systemLogEntriesAfter: remainingSystemLogCount,
+      systemLogTruncations,
+      systemLogsRemoved,
+      logArtifactsRemoved
+    });
   }
 
   return trimmed;
@@ -1274,6 +1305,9 @@ function normalizeEndpoint(rawEndpoint, options = {}) {
 }
 
 async function recordDiagnostic(code, details = {}, options = {}) {
+  const now = Date.now();
+  pruneTransientDiagnostics(now);
+
   const entry = {
     code,
     details,
@@ -1300,9 +1334,18 @@ async function recordDiagnostic(code, details = {}, options = {}) {
       return;
     }
 
-    const existing = Array.isArray(data?.[DIAGNOSTICS_STORAGE_KEY])
-      ? data[DIAGNOSTICS_STORAGE_KEY]
-      : [];
+    let existing = Array.isArray(data?.[DIAGNOSTICS_STORAGE_KEY]) ? data[DIAGNOSTICS_STORAGE_KEY] : [];
+
+    const retention = applyDiagnosticRetention(existing, now);
+    if (retention.pruned > 0) {
+      await recordDiagnostic(
+        'diagnostics-retention-pruned',
+        { count: retention.pruned },
+        { skipStorage: true }
+      );
+    }
+
+    existing = retention.kept;
 
     const lastStored = existing[existing.length - 1];
     if (lastStored && diagnosticsEntriesMatch(lastStored, entry)) {
@@ -1315,6 +1358,81 @@ async function recordDiagnostic(code, details = {}, options = {}) {
   } catch (error) {
     console.warn('[ChromeOS Graylog Agent] Failed to record diagnostic event', error);
   }
+}
+
+async function enforceDiagnosticRetention() {
+  if (!Number.isFinite(DIAGNOSTIC_RETENTION_WINDOW_MS) || DIAGNOSTIC_RETENTION_WINDOW_MS <= 0) {
+    return;
+  }
+
+  const now = Date.now();
+
+  try {
+    const { data, success } = await getStorageLocal(DIAGNOSTICS_STORAGE_KEY);
+    if (!success) {
+      return;
+    }
+
+    const existing = Array.isArray(data?.[DIAGNOSTICS_STORAGE_KEY]) ? data[DIAGNOSTICS_STORAGE_KEY] : [];
+    const { kept, pruned } = applyDiagnosticRetention(existing, now);
+    if (pruned === 0 && kept.length === existing.length) {
+      return;
+    }
+
+    const trimmed = kept.slice(-MAX_DIAGNOSTIC_ENTRIES);
+    await setStorageLocal({ [DIAGNOSTICS_STORAGE_KEY]: trimmed });
+
+    if (pruned > 0) {
+      await recordDiagnostic(
+        'diagnostics-retention-pruned',
+        { count: pruned },
+        { skipStorage: true }
+      );
+    }
+  } catch (error) {
+    console.warn('[ChromeOS Graylog Agent] Failed to enforce diagnostic retention', error);
+  }
+}
+
+function applyDiagnosticRetention(entries, now = Date.now()) {
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return { kept: [], pruned: 0 };
+  }
+
+  if (!Number.isFinite(DIAGNOSTIC_RETENTION_WINDOW_MS) || DIAGNOSTIC_RETENTION_WINDOW_MS <= 0) {
+    return { kept: entries.slice(), pruned: 0 };
+  }
+
+  const cutoff = now - DIAGNOSTIC_RETENTION_WINDOW_MS;
+  const kept = [];
+  let pruned = 0;
+
+  for (const entry of entries) {
+    const timestamp = Date.parse(entry?.timestamp ?? '');
+    if (Number.isFinite(timestamp) && timestamp < cutoff) {
+      pruned += 1;
+      continue;
+    }
+
+    kept.push(entry);
+  }
+
+  return { kept, pruned };
+}
+
+function pruneTransientDiagnostics(now = Date.now()) {
+  if (transientDiagnostics.length === 0) {
+    return;
+  }
+
+  const { kept } = applyDiagnosticRetention(transientDiagnostics, now);
+  if (kept.length === transientDiagnostics.length) {
+    return;
+  }
+
+  transientDiagnostics.length = 0;
+  const trimmed = kept.slice(-MAX_DIAGNOSTIC_ENTRIES);
+  transientDiagnostics.push(...trimmed);
 }
 
 function getStorageLocal(keys) {

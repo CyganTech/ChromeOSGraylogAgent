@@ -13,13 +13,17 @@
     "enterprise.deviceAttributes"
   ],
   "host_permissions": [
-    "https://logs.example.com/*"
+    "https://*.example.com/*"
   ],
   "background": {
     "service_worker": "service_worker.js"
   },
   "icons": {
     "128": "assets/icon128.png"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
   },
   "action": {
     "default_title": "ChromeOS Graylog Agent"
